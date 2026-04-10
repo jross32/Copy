@@ -1,0 +1,31 @@
+{
+  "name": "ai-coder",
+  "version": "0.1.0",
+  "description": "An AI coding assistant powered by Claude",
+  "type": "module",
+  "bin": {
+    "ai-coder": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "glob": "^11.0.0",
+    "ink": "^5.1.0",
+    "ink-spinner": "^5.0.0",
+    "react": "^18.3.1",
+    "strip-ansi": "^7.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.5",
+    "tsx": "^4.19.1",
+    "typescript": "^5.5.4"
+  }
+}
