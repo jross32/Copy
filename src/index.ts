@@ -4,28 +4,25 @@ import { createInterface } from 'readline'
 import { resolve } from 'path'
 import process from 'process'
 import chalk from 'chalk'
-import type { MessageParam } from '@anthropic-ai/sdk/resources/index.js'
 import { getEnabledTools } from './tools.js'
 import { query } from './query.js'
 import { getContext, buildSystemPrompt } from './context.js'
 import { hasPermissionsToUseTool, initConfig, addAllowedTool, getPermissionKey } from './permissions.js'
+import { getProvider, type Provider } from './services/backend.js'
 import type { Tool, ToolUseContext } from './Tool.js'
+import type { UnifiedMessage } from './services/provider.js'
 
 // ─── Terminal helpers ────────────────────────────────────────────────────────
-
-function clearLine() {
-  process.stdout.write('\r\x1b[K')
-}
 
 function printAssistantText(text: string) {
   process.stdout.write(chalk.white(text))
 }
 
 function printToolStart(toolName: string, input: string) {
-  console.log(chalk.cyan(`\n  [${toolName}] ${chalk.gray(input)}`))
+  console.log(chalk.cyan(`\n  [${toolName}] `) + chalk.gray(input))
 }
 
-function printToolResult(toolName: string, output: string | undefined, isError: boolean) {
+function printToolResult(output: string | undefined, isError: boolean) {
   if (!output) return
   const preview = output.slice(0, 300)
   const truncated = output.length > 300 ? chalk.gray(' …') : ''
@@ -37,22 +34,39 @@ function printError(message: string) {
   console.error(chalk.red(`\nError: ${message}`))
 }
 
-function printBanner() {
-  console.log(chalk.bold.blue('\n  AI Coder  ') + chalk.gray('powered by Claude\n'))
-  console.log(chalk.gray('  Type your request, or /help for commands, /quit to exit\n'))
+function printBanner(backendName: string, model: string) {
+  console.log()
+  console.log(chalk.bold.blue('  AI Coder') + chalk.gray(`  — ${backendName}`) + chalk.dim(` (${model})`))
+  console.log(chalk.gray('  Type your request, or /help for commands, /quit to exit'))
+  console.log()
 }
 
 function printHelp() {
   console.log(chalk.bold('\nAvailable commands:'))
-  console.log('  /help          Show this help message')
+  console.log('  /help          Show this help')
   console.log('  /clear         Clear conversation history')
   console.log('  /tools         List available tools')
-  console.log('  /allow <tool>  Permanently allow a tool without prompting')
+  console.log('  /allow <tool>  Allow a tool for this session without prompting')
   console.log('  /quit          Exit')
   console.log()
 }
 
-// ─── Permission prompt ────────────────────────────────────────────────────────
+function printSetupHint() {
+  console.log(chalk.yellow('\nNo AI backend available.\n'))
+  console.log(chalk.bold('Option 1') + chalk.gray(' — Claude (API key required):'))
+  console.log(chalk.gray('  export ANTHROPIC_API_KEY=sk-ant-...'))
+  console.log()
+  console.log(chalk.bold('Option 2') + chalk.gray(' — Ollama (free, runs locally, no key needed):'))
+  console.log(chalk.gray('  # Install Ollama'))
+  console.log(chalk.gray('  curl -fsSL https://ollama.com/install.sh | sh'))
+  console.log(chalk.gray('  # Pull a coding model (~4 GB)'))
+  console.log(chalk.gray('  ollama pull qwen2.5-coder:7b'))
+  console.log(chalk.gray('  # Ollama auto-starts, then run again:'))
+  console.log(chalk.gray('  npx tsx src/index.ts'))
+  console.log()
+}
+
+// ─── Permission prompt ─────────────────────────────────────────────────────
 
 async function promptForPermission(
   tool: Tool,
@@ -63,19 +77,19 @@ async function promptForPermission(
   console.log(chalk.yellow(`\n  Permission required:`))
   console.log(chalk.yellow(`  Tool: ${chalk.bold(tool.name)}`))
   console.log(chalk.yellow(`  Action: ${display}`))
-  console.log(chalk.gray('  [y] Allow once  [a] Allow always  [n] Deny  → '), '')
+  process.stdout.write(chalk.gray('  [y] Allow once  [a] Allow always  [n] Deny  → '))
 
-  return new Promise(resolve => {
+  return new Promise(res => {
     rl.question('', answer => {
       const a = answer.trim().toLowerCase()
-      if (a === 'a') resolve('allow-all')
-      else if (a === 'y' || a === '') resolve('allow')
-      else resolve('deny')
+      if (a === 'a') res('allow-all')
+      else if (a === 'n') res('deny')
+      else res('allow') // default: allow once
     })
   })
 }
 
-// ─── Main session ─────────────────────────────────────────────────────────────
+// ─── Session ──────────────────────────────────────────────────────────────────
 
 async function runSession(options: {
   cwd: string
@@ -85,10 +99,22 @@ async function runSession(options: {
 }) {
   const { cwd, dangerouslySkipPermissions, printMode, initialPrompt } = options
 
+  // Get backend — exit with helpful message if none available
+  let provider: Provider
+  try {
+    provider = await getProvider()
+  } catch (err) {
+    if (!printMode) printSetupHint()
+    else console.error(String(err))
+    process.exit(1)
+  }
+
   initConfig(cwd)
 
-  const tools = await getEnabledTools()
-  const contextStr = await getContext(cwd)
+  const [tools, contextStr] = await Promise.all([
+    getEnabledTools(),
+    getContext(cwd),
+  ])
   const systemPrompt = buildSystemPrompt(contextStr)
 
   const rl = createInterface({
@@ -97,8 +123,7 @@ async function runSession(options: {
     terminal: !printMode,
   })
 
-  const conversationHistory: MessageParam[] = []
-  // Session-level allowed tools (for this run only)
+  const conversationHistory: UnifiedMessage[] = []
   const sessionAllowedTools: string[] = []
 
   const context: ToolUseContext = {
@@ -110,13 +135,11 @@ async function runSession(options: {
     },
   }
 
-  // Handle Ctrl+C gracefully
+  // Ctrl+C: abort current request, second Ctrl+C exits
   process.on('SIGINT', () => {
-    if (context.abortController.signal.aborted) {
-      process.exit(0)
-    }
+    if (context.abortController.signal.aborted) process.exit(0)
     context.abortController.abort()
-    console.log(chalk.yellow('\n  [Interrupted]'))
+    console.log(chalk.yellow('\n  [Interrupted — press Ctrl+C again to exit]'))
   })
 
   const canUseTool = async (tool: Tool, input: Record<string, unknown>) => {
@@ -129,8 +152,7 @@ async function runSession(options: {
         sessionAllowedTools.push(key)
         return { result: true as const }
       } else if (answer === 'allow') {
-        const key = getPermissionKey(tool, input)
-        sessionAllowedTools.push(key)
+        sessionAllowedTools.push(getPermissionKey(tool, input))
         return { result: true as const }
       } else {
         return { result: false as const, message: 'Permission denied by user' }
@@ -140,30 +162,38 @@ async function runSession(options: {
   }
 
   async function sendMessage(userText: string) {
-    conversationHistory.push({
-      role: 'user',
-      content: userText,
-    })
+    conversationHistory.push({ role: 'user', content: userText })
+
+    // Fresh abort controller for each request
+    const reqAbort = new AbortController()
+    const reqContext: ToolUseContext = {
+      ...context,
+      abortController: reqAbort,
+    }
 
     let firstText = true
 
     for await (const msg of query({
+      provider,
       messages: [...conversationHistory],
       tools,
       systemPrompt,
-      context: {
-        ...context,
-        abortController: new AbortController(),
-      },
-      onMessage: (msg) => {
+      context: reqContext,
+      onMessage: msg => {
         if (msg.type === 'progress') {
-          printToolStart(msg.toolName, JSON.stringify(msg.input).slice(0, 100))
-          if (msg.output !== undefined) {
-            printToolResult(msg.toolName, msg.output, false)
+          const inputStr = typeof msg.input === 'object'
+            ? Object.entries(msg.input)
+                .map(([k, v]) => `${k}=${JSON.stringify(v).slice(0, 60)}`)
+                .join(' ')
+            : String(msg.input)
+          if (msg.output === undefined) {
+            printToolStart(msg.toolName, inputStr)
+          } else {
+            printToolResult(msg.output, msg.isError ?? false)
           }
         }
       },
-      onText: (delta) => {
+      onText: delta => {
         if (firstText) {
           process.stdout.write('\n')
           firstText = false
@@ -173,38 +203,22 @@ async function runSession(options: {
       canUseTool,
     })) {
       if (msg.type === 'assistant') {
-        // Collect full assistant response for history
-        const textContent = msg.content
-          .filter(b => b.type === 'text')
-          .map(b => (b as { type: 'text'; text: string }).text)
-          .join('')
+        if (!firstText) process.stdout.write('\n')
 
-        if (textContent && !firstText) {
-          process.stdout.write('\n')
-        }
+        // Add to conversation history
+        conversationHistory.push({ role: 'assistant', content: msg.content })
 
-        // Add to history
-        conversationHistory.push({
-          role: 'assistant',
-          content: msg.content,
-        })
-
-        if (printMode) {
-          // In print mode, just output the text and exit
-          break
-        }
+        if (printMode) break
       }
     }
 
     console.log()
   }
 
-  // Handle slash commands
+  // Slash commands
   function handleCommand(input: string): boolean {
     const parts = input.trim().split(/\s+/)
-    const cmd = parts[0]
-
-    switch (cmd) {
+    switch (parts[0]) {
       case '/help':
         printHelp()
         return true
@@ -214,8 +228,8 @@ async function runSession(options: {
         return true
       case '/tools':
         console.log(chalk.bold('\nAvailable tools:'))
-        for (const tool of tools) {
-          console.log(`  ${chalk.cyan(tool.name.padEnd(15))} ${chalk.gray(tool.description.slice(0, 60))}`)
+        for (const t of tools) {
+          console.log(`  ${chalk.cyan(t.name.padEnd(15))}${chalk.gray(t.description.slice(0, 65))}`)
         }
         console.log()
         return true
@@ -227,6 +241,7 @@ async function runSession(options: {
         return true
       case '/quit':
       case '/exit':
+      case '/q':
         console.log(chalk.gray('\n  Goodbye!\n'))
         rl.close()
         process.exit(0)
@@ -235,13 +250,11 @@ async function runSession(options: {
   }
 
   if (!printMode) {
-    printBanner()
+    printBanner(provider.name, provider.model)
   }
 
   if (initialPrompt) {
-    if (!printMode) {
-      console.log(chalk.bold.blue('You: ') + initialPrompt)
-    }
+    if (!printMode) console.log(chalk.bold.blue('You: ') + initialPrompt)
     await sendMessage(initialPrompt)
     if (printMode) {
       rl.close()
@@ -249,20 +262,12 @@ async function runSession(options: {
     }
   }
 
-  // Interactive REPL loop
+  // Interactive REPL
   const promptUser = () => {
-    rl.question(chalk.bold.blue('\nYou: '), async (input) => {
+    rl.question(chalk.bold.blue('\nYou: '), async input => {
       const trimmed = input.trim()
-      if (!trimmed) {
-        promptUser()
-        return
-      }
-
-      if (handleCommand(trimmed)) {
-        promptUser()
-        return
-      }
-
+      if (!trimmed) { promptUser(); return }
+      if (handleCommand(trimmed)) { promptUser(); return }
       await sendMessage(trimmed)
       promptUser()
     })
@@ -271,30 +276,24 @@ async function runSession(options: {
   promptUser()
 }
 
-// ─── CLI setup ────────────────────────────────────────────────────────────────
+// ─── CLI ──────────────────────────────────────────────────────────────────────
 
 program
   .name('ai-coder')
-  .description('An AI coding assistant powered by Claude')
+  .description('An AI coding assistant — works with Claude (API key) or Ollama (free, local)')
   .version('0.1.0')
-  .argument('[prompt]', 'Initial prompt to send (optional)')
-  .option('-p, --print', 'Print mode: output response and exit (non-interactive)', false)
-  .option(
-    '--dangerously-skip-permissions',
-    'Skip all permission prompts (for CI/CD environments only)',
-    false,
-  )
+  .argument('[prompt]', 'Initial prompt (optional)')
+  .option('-p, --print', 'Non-interactive: print response and exit', false)
+  .option('--dangerously-skip-permissions', 'Skip all permission prompts (CI use only)', false)
   .option('--cwd <path>', 'Working directory', process.cwd())
   .action(async (prompt: string | undefined, opts: {
     print: boolean
     dangerouslySkipPermissions: boolean
     cwd: string
   }) => {
-    const cwd = resolve(opts.cwd)
-
     try {
       await runSession({
-        cwd,
+        cwd: resolve(opts.cwd),
         dangerouslySkipPermissions: opts.dangerouslySkipPermissions,
         printMode: opts.print,
         initialPrompt: prompt,
