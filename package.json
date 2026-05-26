@@ -4,12 +4,15 @@
   "description": "An AI coding assistant powered by Claude",
   "type": "module",
   "bin": {
-    "ai-coder": "./dist/index.js"
+    "ai-coder": "./dist/index.js",
+    "corellium": "./dist/corellium/cli.js"
   },
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "corellium": "tsx src/corellium/cli.ts",
+    "corellium:verify": "tsx src/corellium/verify.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
@@ -25,6 +28,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/react": "^18.3.5",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.19.1",
     "typescript": "^5.5.4"
   }
